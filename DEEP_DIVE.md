@@ -45,6 +45,14 @@
    - 4.11 [记忆与 Compact 的交互](#411-记忆与-compact-的交互)
    - 4.12 [关键常量速查](#412-记忆系统关键常量)
    - 4.13 [记忆系统完整数据流](#413-记忆系统完整数据流)
+5. [SubAgent 系统：从 sideQuery 到 Fork 的完整架构](#5-subagent-系统)
+   - 5.1 [sideQuery：最轻量的子调用](#51-sidequery)
+   - 5.2 [runForkedAgent：完整循环 + Prompt Cache 共享](#52-runforkedagent)
+   - 5.3 [AgentTool：模型主动启动子 Agent](#53-agenttool)
+   - 5.4 [Permission Modes：子 Agent 的权限模型](#54-permission-modes)
+   - 5.5 [Coordinator Mode vs Fork：两种并行策略](#55-coordinator-mode-vs-fork)
+   - 5.6 [成本分析：为什么 Prompt Cache 共享如此重要](#56-成本分析)
+   - 5.7 [设计启发](#57-设计启发)
 
 ---
 
@@ -2218,6 +2226,392 @@ Compact（上下文压缩）对记忆系统有以下影响：
 │                                                            │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## 5. SubAgent 系统：从 sideQuery 到 Fork 的完整架构
+
+Claude Code 的"子 Agent"不是一个独立模块，而是散布在系统各处的**三层调用机制**，从轻到重分别是：sideQuery（单次 API 调用）、runForkedAgent（带 prompt cache 共享的完整循环）、AgentTool（模型主动发起的子 Agent）。本节从底层到上层逐一拆解。
+
+### 5.1 sideQuery：最轻量的子调用
+
+`sideQuery()` 是对 Anthropic API `messages.create()` 的薄封装，位于 `src/utils/sideQuery.ts`。它**不走 query loop**，不执行工具，不追踪 usage，不记录 transcript。
+
+```typescript
+// src/utils/sideQuery.ts — 核心签名
+export async function sideQuery(options: SideQueryOptions): Promise<BetaMessage> {
+  // 1. 标准化处理
+  //    - 加 CLI attribution header（OAuth 验证）
+  //    - model string 标准化（去掉 [1m] 后缀）
+  //    - 加正确的 beta flags
+  //    - 计算 fingerprint
+  // 2. 一次性 API 调用
+  return client.beta.messages.create({
+    model, system, messages, max_tokens, tools, tool_choice, ...
+  })
+}
+```
+
+**设计定位**：适合"问模型一个问题，拿一个答案"的场景。
+
+**典型使用者**：
+| 调用方 | 用途 | 模型 | max_tokens |
+|--------|------|------|------------|
+| `selectRelevantMemories()` | 记忆召回的语义选择 | Sonnet | 256 |
+| `yoloClassifier` | 权限决策分类 | 配置决定 | 1024 |
+| Session Search | 搜索历史会话 | 配置决定 | 1024 |
+| Model validation | 检查模型能力 | 目标模型 | 1024 |
+
+**关键限制**：
+- 默认 `max_tokens: 1024`
+- 无工具调用能力（除非 `tools` 参数主动传入，但也只处理一轮）
+- 无 prompt cache 协调（每次独立请求）
+- 不记录 transcript（无 session resume）
+- 支持 structured output（JSON schema）和 thinking 配置
+
+**与 runForkedAgent 的分界线**：如果需要工具执行、多轮对话、usage 追踪，就必须用 runForkedAgent。sideQuery 只适合无状态的一问一答。
+
+### 5.2 runForkedAgent：完整循环 + Prompt Cache 共享
+
+`runForkedAgent()` 位于 `src/utils/forkedAgent.ts`，是后台子 Agent 的核心运行时。它启动的是和主 Agent **完全相同的 `query()` 函数**，带工具执行、多轮对话、usage 累计。
+
+#### 5.2.1 核心流程
+
+```
+Parent Agent 完成一轮
+    ↓
+handleStopHooks() → saveCacheSafeParams(params)  ← 存到模块级全局变量
+    ↓
+post-sampling hook 触发（如 session memory extraction）
+    ↓
+getLastCacheSafeParams() → 取出参数
+    ↓
+runForkedAgent({
+  promptMessages,        ← 子 Agent 的初始 prompt
+  cacheSafeParams,       ← 必须和父字节一致的参数
+  canUseTool,            ← 权限函数
+  querySource,           ← 追踪来源
+  forkLabel,             ← 分析标签
+  maxTurns?,             ← 可选的轮数限制
+  skipTranscript?,       ← 是否跳过 transcript 记录
+  skipCacheWrite?,       ← 是否跳过 cache 写入
+})
+    ↓
+1. createSubagentContext() → 创建隔离上下文
+2. initialMessages = [...forkContextMessages, ...promptMessages]
+3. for await (message of query({...})) { 
+     accumulateUsage(); recordTranscript(); yield message 
+   }
+4. finally: readFileState.clear(); initialMessages.length = 0
+    ↓
+return { messages, totalUsage }
+```
+
+#### 5.2.2 CacheSafeParams：缓存一致性的核心
+
+Anthropic API 的 prompt cache key 由以下部分组成：system prompt、tools、model、messages（前缀）、thinking config。子 Agent 要共享父的 cache，**必须保证这些参数字节级一致**。
+
+```typescript
+// src/utils/forkedAgent.ts
+export type CacheSafeParams = {
+  systemPrompt: SystemPrompt      // 必须和父一模一样
+  userContext: { [k: string]: string }  // 影响消息前缀
+  systemContext: { [k: string]: string } // 影响 system prompt
+  toolUseContext: ToolUseContext    // 包含 tools 定义、model、thinkingConfig
+  forkContextMessages: Message[]   // 父的历史消息（cache 前缀的主体部分）
+}
+```
+
+**关键设计决策**：
+
+1. **为什么 `CacheSafeParams` 用模块级全局变量存储？** 因为 post-sampling hook 的调用方（`handleStopHooks`）和消费方（各种后台 fork）在不同的调用栈中。用闭包或参数传递需要层层穿透，全局变量最简洁。每轮只存一次、立刻消费，无并发问题。
+
+2. **maxOutputTokens 会破坏缓存**：`budget_tokens`（thinking 配置的一部分）是缓存键的一部分。如果子 Agent 设了 `maxOutputTokens`，`claude.ts` 中会 clamp `budget_tokens`，导致 thinking config 变化 → 缓存失效。所以 `ForkedAgentParams` 的注释明确警告：*Only set this when cache sharing is not a goal*。
+
+3. **`forkContextMessages` 不做 `filterIncompleteToolCalls`**：表面上看应该过滤掉不完整的 tool_use block（API 规范要求 tool_use 必须配对 tool_result）。但实际上，downstream 的 `ensureToolResultPairing`（在 `claude.ts` 中）会自动修补。这里不过滤反而**保证了和父 Agent 发送的字节完全一致**，如果在这里过滤，修补的方式可能和父不同 → cache 前缀不一致 → cache miss。
+
+#### 5.2.3 createSubagentContext：精确的状态隔离
+
+`createSubagentContext()` 是所有子 Agent 的上下文工厂。它的核心设计原则是**默认隔离，显式 opt-in 共享**。
+
+```typescript
+// src/utils/forkedAgent.ts — 简化后的核心逻辑
+export function createSubagentContext(
+  parentContext: ToolUseContext,
+  overrides?: SubagentContextOverrides,
+): ToolUseContext {
+  return {
+    // ===== 默认隔离（clone） =====
+    readFileState: cloneFileStateCache(parent.readFileState),
+    contentReplacementState: cloneContentReplacementState(parent.contentReplacementState),
+    
+    // ===== 默认隔离（全新） =====
+    nestedMemoryAttachmentTriggers: new Set<string>(),
+    loadedNestedMemoryPaths: new Set<string>(),
+    discoveredSkillNames: new Set<string>(),
+    toolDecisions: undefined,
+    queryTracking: { chainId: randomUUID(), depth: parent.depth + 1 },
+    agentId: createAgentId(),
+    
+    // ===== 默认 no-op（安全封堵） =====
+    setAppState: () => {},
+    setInProgressToolUseIDs: () => {},
+    setResponseLength: () => {},
+    addNotification: undefined,
+    setToolJSX: undefined,
+    setStreamMode: undefined,
+    
+    // ===== 特殊处理 =====
+    // 任务注册/kill 必须穿透到根 store（否则子 Agent 启动的后台 bash 变僵尸）
+    setAppStateForTasks: parent.setAppStateForTasks ?? parent.setAppState,
+    // denial 计数器必须本地化（否则重试间的 denial 累积丢失）
+    localDenialTracking: createDenialTrackingState(),
+    // 非交互式子 Agent 默认不弹权限确认框
+    getAppState: () => ({ ...parent.getAppState(), shouldAvoidPermissionPrompts: true }),
+    // abort 单向传播：父 abort → 子 abort，子不影响父
+    abortController: createChildAbortController(parent.abortController),
+    
+    // ===== Opt-in 共享（给交互式子 Agent） =====
+    // shareSetAppState: true → 用父的 setAppState
+    // shareAbortController: true → 共用同一个 abort controller
+    // shareSetResponseLength: true → metrics 归入父
+  }
+}
+```
+
+**为什么 `readFileState` 是 clone 而不是全新创建？**
+
+这是一个精妙的缓存一致性问题：
+
+```
+父 Agent 的历史消息中包含 tool_use_id: "abc123"
+    ↓
+子 Agent 的 forkContextMessages 也包含这个 "abc123"
+    ↓
+contentReplacementState 根据 id 决定："这个 tool_result 要不要持久化到磁盘？"
+    ↓
+如果子 Agent 用全新 state → 它没见过之前的上下文 → 可能做出不同决策
+    ↓
+API 请求中该 tool_result 的内容（原文 vs 磁盘引用）不同
+    ↓
+cache 前缀不一致 → cache miss
+```
+
+Clone 保证子 Agent 对历史 tool_use_id 做出**和父完全相同的替换决策**，从而保持 wire 前缀字节一致。
+
+#### 5.2.4 Fork 子 Agent 的消息构建
+
+当多个 fork 子 Agent 从同一个父消息点分叉时，`buildForkedMessages()` 负责构建最大化 cache 共享的消息序列：
+
+```typescript
+// src/tools/AgentTool/forkSubagent.ts
+export function buildForkedMessages(
+  directive: string,               // 每个子 Agent 不同的指令
+  assistantMessage: AssistantMessage, // 父的 assistant 消息（含所有 tool_use block）
+): Message[] {
+  // 1. 完整复制父的 assistant message（所有 tool_use block、thinking、text）
+  const fullAssistantMessage = { ...assistantMessage, uuid: randomUUID() }
+  
+  // 2. 为每个 tool_use 填充 **完全相同的** placeholder result
+  const toolResultBlocks = toolUseBlocks.map(block => ({
+    type: 'tool_result',
+    tool_use_id: block.id,
+    content: [{ type: 'text', text: 'Fork started — processing in background' }],
+  }))
+  
+  // 3. 最后追加一个 per-child 的 directive text block
+  const userMessage = createUserMessage({
+    content: [...toolResultBlocks, { type: 'text', text: buildChildMessage(directive) }],
+  })
+  
+  return [fullAssistantMessage, userMessage]
+}
+```
+
+**效果**：所有 fork 子 Agent 的消息序列中，只有最后一个 text block（directive）不同，前面的 assistant message + tool_result placeholder 完全一致 → **99% 前缀命中 cache**。
+
+**反递归保护**：Fork 子 Agent 的消息中包含 `<fork-boilerplate>` 标签。`isInForkChild()` 在 Agent 调用时检查消息历史是否包含此标签，有则拒绝再次 fork，防止无限递归。
+
+### 5.3 AgentTool：模型主动启动子 Agent
+
+AgentTool 是一个普通的 `buildTool({...})` 工具，位于 `src/tools/AgentTool/AgentTool.tsx`。模型通过调用这个工具来启动子 Agent。
+
+#### 5.3.1 输入 Schema
+
+```typescript
+// 核心字段（简化）
+{
+  prompt: string           // 给子 Agent 的任务描述
+  description: string      // 3-5 词简短描述（UI 显示）
+  subagent_type?: string   // 指定类型：Explore / Plan / Verification / general-purpose
+                           // 不指定 + FORK_SUBAGENT 开启 → 隐式 fork
+  model?: string           // 覆盖模型（sonnet/opus/haiku）
+  run_in_background?: bool // 后台异步执行
+  mode?: string            // 权限模式（plan/acceptEdits/default/...）
+  isolation?: string       // 'worktree'（git worktree 隔离）或 'remote'
+}
+```
+
+#### 5.3.2 Agent 类型选择流程
+
+```
+模型调用 AgentTool({ prompt, subagent_type })
+    ↓
+subagent_type 未指定 && FORK_SUBAGENT 开启？
+    ├─ 是 → 走 fork 路径（FORK_AGENT 定义）
+    │       tools: ['*'], maxTurns: 200, permissionMode: 'bubble'
+    │       继承父的完整上下文 + system prompt
+    └─ 否 → 按 subagent_type 查找 Agent 定义
+            ├─ 内置 Agent：Explore / Plan / Verification / general-purpose
+            ├─ 用户自定义：.claude/agents/*.md
+            └─ Plugin Agent：插件系统加载
+```
+
+#### 5.3.3 六种内置 Agent 类型
+
+| Agent | 核心定位 | 工具策略 | 模型 | maxTurns | 缓存共享 |
+|-------|---------|---------|------|----------|---------|
+| **Fork** | 继承父上下文做子任务 | `['*']`（和父一样） | inherit | 200 | ✅ 是 |
+| **Explore** | 只读代码搜索 | 禁 FileEdit/FileWrite/AgentTool | haiku（外部）/inherit（内部） | 无限 | ❌ 否 |
+| **Plan** | 架构规划 | 同 Explore | inherit | 无限 | ❌ 否 |
+| **Verification** | 对抗性测试 | 可用 Bash（含写 /tmp），禁项目写 | inherit | 无限 | ❌ 否 |
+| **General Purpose** | 通用（Skill/Command 默认） | `['*']` | `getDefaultSubagentModel()` | 无限 | ❌ 否 |
+| **Session Memory** | 后台记忆提取 | 仅 FileRead + FileEdit（限 memory 目录） | inherit | 5 | ✅ 是 |
+
+**Explore Agent 的特殊优化**：
+- 不加载 CLAUDE.md（探索 Agent 不需要项目规则，主 Agent 有完整上下文会解读结果）
+- 系统 prompt 强调效率："spawn multiple parallel tool calls"
+- Bash 只允许只读命令（ls, git status, git log, find, cat, head, tail）
+
+**Verification Agent 的对抗性设计**：
+- 系统 prompt 极长（~3000 字），详细列出各种变更类型的验证策略
+- 核心哲学："你的工作不是确认它能用——是试图打破它"
+- 自我对话提醒："如果你在写解释而不是命令，停下来。运行那个命令。"
+- 特殊检查：浏览器自动化 MCP 可用时必须使用，不能说"需要真正的浏览器"然后跳过
+- 对每种变更类型（前端/后端/CLI/基础设施/重构/数据管道/DB迁移...）都有定制化的验证流程
+
+#### 5.3.4 Agent 的执行生命周期
+
+```
+AgentTool.call() 被调用
+    ↓
+1. 解析 Agent 定义（内置/自定义/插件）
+2. 初始化 Agent 专属 MCP 服务器（如果有的话）
+3. 解析工具集（resolveAgentTools：合并 disallowedTools、addedTools、MCP 工具）
+4. 获取模型（getAgentModel：按优先级 model覆盖 > Agent定义 > 默认）
+5. 渲染系统 prompt（enhanceSystemPromptWithEnvDetails 加环境信息）
+6. createSubagentContext()（状态隔离）
+7. 可选：executeSubagentStartHooks()（前置钩子）
+8. 可选：registerFrontmatterHooks()（Agent 定义中的 hooks）
+    ↓
+for await (message of query({
+  messages: initialMessages,
+  systemPrompt: agentSystemPrompt,
+  canUseTool,
+  toolUseContext: agentToolUseContext,
+  maxTurns,
+})) {
+  // 转发 API metrics 给父
+  // 记录 transcript
+  // yield 消息给调用方
+}
+    ↓
+finally {
+  mcpCleanup()                    // 断开 Agent 专属 MCP 连接
+  clearSessionHooks()             // 清除 frontmatter hooks
+  cleanupAgentTracking()          // prompt cache 追踪
+  readFileState.clear()           // 释放文件状态缓存
+  initialMessages.length = 0      // 释放消息数组
+  unregisterPerfettoAgent()       // 取消 perfetto 追踪
+  clearAgentTranscriptSubdir()    // transcript 目录映射
+  rootSetAppState(清理 todos)     // 清理 UI 状态
+  killShellTasksForAgent(agentId) // Kill 后台 bash 任务
+}
+```
+
+**清理的关键性**：如果子 Agent 启动了后台 shell 命令但自己退出了，`killShellTasksForAgent` 确保这些命令被杀掉。否则这些进程变成僵尸（PPID=1 zombie），可能持续消耗资源或锁定文件。这就是为什么 `setAppStateForTasks` 即使在 `setAppState` 为 no-op 时也必须穿透到根 store——注册和 kill 必须在同一个 store 中才能匹配。
+
+### 5.4 Permission Modes：子 Agent 的权限模型
+
+子 Agent 的权限控制通过 `permissionMode` 字段配置，决定子 Agent 遇到需要用户确认的操作时怎么处理：
+
+| Mode | 行为 | 适用场景 |
+|------|------|---------|
+| `default` | 弹确认框问用户 | 交互式子 Agent |
+| `plan` | 只能规划，执行需审批 | 需要人工审查的任务 |
+| `acceptEdits` | 自动接受编辑操作 | 大多数工人 Agent 的默认值 |
+| `bypassPermissions` | 跳过所有权限检查 | 完全信任的内部 Agent |
+| `dontAsk` | 不问、直接拒绝 | 静默失败场景 |
+| `bubble` | 权限请求冒泡到父终端 | Fork 子 Agent（父负责交互） |
+| `auto` | 分类器驱动（内部专用） | 内部自动化场景 |
+
+**`bubble` 模式的设计**：Fork 子 Agent 继承了父的全部工具（包括写操作），但它不应该自己弹确认框（它没有独立终端）。`bubble` 模式把权限请求传递到父 Agent 的终端，由父来决定。这需要 `shareAbortController: true`（共享 abort 意味着可以使用父的 UI 通道）。
+
+**非交互式子 Agent 的默认行为**：`createSubagentContext()` 默认设置 `shouldAvoidPermissionPrompts: true`，这意味着子 Agent 如果遇到需要确认的操作会**静默跳过**而不是卡住等待用户输入（没人看的子 Agent 卡住 = 死锁）。
+
+### 5.5 Coordinator Mode vs Fork：两种并行策略
+
+这两者**互斥**——当 `isCoordinatorMode()` 为 true 时，fork 子 Agent 被禁用。
+
+```
+                     ┌─────────────────────────────────┐
+                     │        Coordinator Mode          │
+                     │   CLAUDE_CODE_COORDINATOR_MODE   │
+                     └───────────────┬─────────────────┘
+                                     │
+                     ┌───────────────┼───────────────┐
+                     ↓               ↓               ↓
+                 Worker A        Worker B        Worker C
+                 (受限工具)      (受限工具)      (受限工具)
+                                     │
+                              scratchpad 目录
+                            （跨 Worker 共享）
+
+                     ┌─────────────────────────────────┐
+                     │          Fork Subagent           │
+                     │    FORK_SUBAGENT feature flag    │
+                     └───────────────┬─────────────────┘
+                                     │
+                     ┌───────────────┼───────────────┐
+                     ↓               ↓               ↓
+                  Fork A          Fork B          Fork C
+               (全部工具)      (全部工具)      (全部工具)
+               (共享 cache)    (共享 cache)    (共享 cache)
+```
+
+| 维度 | Fork | Coordinator |
+|------|------|-------------|
+| **触发方式** | 模型省略 `subagent_type` | 环境变量 |
+| **上下文继承** | 完整（全部消息 + 全部工具） | 受限（`ASYNC_AGENT_ALLOWED_TOOLS`） |
+| **Prompt Cache** | 和父共享（字节级一致） | 不共享 |
+| **权限模型** | bubble 到父终端 | 各工人独立 |
+| **跨 Agent 通信** | 无（各自独立） | scratchpad 目录 |
+| **设计目标** | "帮我做这个子任务"（对话分支） | "把大任务分配给多个工人"（任务编排） |
+
+Coordinator 工人的工具集 `ASYNC_AGENT_ALLOWED_TOOLS` 包含：文件操作（Read/Edit/Write）、Bash、MCP 工具，但排除 AgentTool 的内部管理工具（TEAM_CREATE、SEND_MESSAGE、SYNTHETIC_OUTPUT）。
+
+### 5.6 成本分析：为什么 Prompt Cache 共享如此重要
+
+一个典型的 Claude Code 会话，主 Agent 的 context 可能有 50K-200K input token。如果子 Agent 不共享 cache：
+
+```
+无共享：每个子 Agent 调用 = 100K input tokens × $3/M = $0.30
+有共享：90% cache_read = 90K × $0.30/M + 10K × $3/M = $0.027 + $0.03 = $0.057
+
+单次节省 ~80%，且子 Agent 越多节省越多（cache 建一次，多个子 Agent 共享读取）
+```
+
+这解释了为什么系统在缓存一致性上花了如此大的工程投入——clone readFileState（而不是新建）、不 filter incomplete tool calls、所有 fork 填相同 placeholder、禁止随意设 maxOutputTokens。每一个看起来"奇怪"的设计决策，背后都是"字节级一致 → cache hit → 省钱"的商业逻辑。
+
+`runForkedAgent` 完成后会 log `tengu_fork_agent_query` 事件，其中 `cacheHitRate = cache_read_input_tokens / total_input_tokens` 用于监控缓存命中率。如果这个比率下降，意味着某个代码变更破坏了前缀一致性。
+
+### 5.7 设计启发
+
+1. **三层调用机制匹配三种成本需求**：sideQuery（轻，无状态，几百 token）→ runForkedAgent（中，带 cache 共享，后台循环）→ AgentTool（重，模型主动发起，完整生命周期）。不是所有"问模型一个问题"都需要完整的 Agent 循环
+2. **缓存一致性是架构约束**：`CacheSafeParams`、clone 而非新建、不过滤不完整的 tool calls、placeholder 统一——所有这些看似奇怪的设计决策，都是为了保证 API 请求前缀字节一致。在 LLM 应用中，prompt cache 的经济性可以决定一个功能是否可行
+3. **状态隔离的粒度控制**：不是简单的"全隔离"或"全共享"，而是逐字段决定。`setAppStateForTasks` 穿透到根（杀僵尸进程）、`localDenialTracking` 本地化（denial 累积正确性）、`shouldAvoidPermissionPrompts` 默认 true（防死锁）——每个决策背后都有具体的 bug 故事
+4. **子 Agent 类型是配置差异，不是继承差异**：六种 Agent 不继承同一个基类，而是六个不同的配置对象传给同一个 `query()` 函数。和工具系统的 `buildTool()` 设计一致——接口统一，内部复杂度自由
+5. **清理是第一优先级**：finally 块中的 8 项清理工作（MCP 连接、bash 进程、transcript、file state、perfetto、todos、hooks、agent tracking）比 try 块中的业务逻辑更关键。子 Agent 的生命周期短、并发度高，任何泄漏都会在长会话中累积成灾
 
 ---
 
