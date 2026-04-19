@@ -224,13 +224,13 @@ queryLoop() 入口
 │      └─ 其他上下文附件                                           │
 │      → yield 每个附件 → 追加到 toolResults                       │
 │                                                                 │
-│  39. 记忆预取消费                                                │
+│  39. 记忆预取消费（并行优化——步骤 0 启动，此处零等待消费）       │
 │      如果 pendingMemoryPrefetch 已 settle 且未消费:              │
 │      → filterDuplicateMemoryAttachments()（排除已 Read 的文件）  │
 │      → yield 每个记忆附件 → 追加到 toolResults                   │
 │      → 标记 consumedOnIteration                                  │
 │                                                                 │
-│  40. 技能发现预取消费                                            │
+│  40. 技能发现预取消费（并行优化——步骤 2 启动，此处零等待消费）   │
 │      collectSkillDiscoveryPrefetch()                              │
 │      → yield 每个技能附件 → 追加到 toolResults                   │
 │                                                                 │
